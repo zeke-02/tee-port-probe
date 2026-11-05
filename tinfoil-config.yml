@@ -44,7 +44,7 @@ containers:
         lock = threading.Lock()
         slots = threading.BoundedSemaphore(50)
 
-        ACME = os.environ.get("ACME_DIRECTORY", "https://acme-staging-v02.api.letsencrypt.org/directory")
+        ACME = os.environ.get("ACME_DIRECTORY", "https://acme-v02.api.letsencrypt.org/directory")
         KEY_DIR = os.environ.get("KEY_DIR", "/run/tinfoil/keys/mail-tls")
         KEY = f"{KEY_DIR}/private_key.pem"
         PUB = f"{KEY_DIR}/public_key.pem"
@@ -164,6 +164,7 @@ containers:
             status["attested_spki_sha256"] = spki_sha256(pem)
             reachable.wait()
             status["reachable_at"] = time.time()
+            time.sleep(15)
             while status["attempts"] < 4:
                 status["attempts"] += 1
                 status["state"] = "issuing"
