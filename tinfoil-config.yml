@@ -1,46 +1,175 @@
-# Probe: can a non-admin container accept public inbound TCP on exactly port 25?
-# Holds no secrets and stores nothing. Port 25 sends one banner line and closes.
+# Probe: does real internet mail reach an enclave through a gateway and tunnel?
+# Holds no secrets. Accepts mail for fountbox.com, discards it, and keeps only
+# connection metadata in memory. /recent is reachable only through the tunnel.
 cvm-version: 0.14.17
 cpus: 2
 memory: 8192
-
-cvm-network:
-  inbound-ports: [25]
 
 networks:
   probe: {}
 
 containers:
   - name: "probe"
-    image: "docker.io/library/python:3.13-alpine@sha256:7984cf56ceaddebe4fefeb75d64000b9f45d8b77b11a09b24524da6cdc3af0c8"
+    image: "docker.io/library/python:3.13-slim@sha256:09a17cad02668ae61ece136b4fd36ac3849e14f670ebedb637ea3e15580525bc"
     networks: [probe]
-    ports: ["25:25"]
-    cvm_admin: true
-    cap_add: [NET_BIND_SERVICE]
+    ports: ["2525:2525", "8081:8081"]
     entrypoint:
       - python
       - -u
       - -c
       - |
-        import socket, threading
-        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import collections, json, re, socket, ssl, subprocess, threading, time
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        HOST = "mx.fountbox.com"
+        DOMAIN = "@fountbox.com"
+        MAX_BYTES = 25 * 1024 * 1024
+        BOOTED = time.time()
+        PROXY = re.compile(rb"^PROXY (?:TCP4|TCP6) (\S+) (\S+) \d+ \d+$")
+
+        events = collections.deque(maxlen=200)
+        lock = threading.Lock()
+        slots = threading.BoundedSemaphore(50)
+
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+             "-nodes", "-keyout", "/tmp/key.pem", "-out", "/tmp/cert.pem", "-days", "7",
+             "-subj", f"/CN={HOST}", "-addext", f"subjectAltName=DNS:{HOST}"],
+            check=True, capture_output=True,
+        )
+        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls.minimum_version = ssl.TLSVersion.TLSv1_2
+        tls.load_cert_chain("/tmp/cert.pem", "/tmp/key.pem")
+
+
+        class Session:
+            def __init__(self, conn):
+                self.conn, self.buf = conn, b""
+
+            def line(self):
+                while b"\r\n" not in self.buf:
+                    if len(self.buf) > 8192:
+                        raise ValueError("line too long")
+                    data = self.conn.recv(4096)
+                    if not data:
+                        raise EOFError
+                    self.buf += data
+                out, self.buf = self.buf.split(b"\r\n", 1)
+                return out
+
+            def send(self, text):
+                self.conn.sendall(text.encode() + b"\r\n")
+
+            def body(self):
+                size = 0
+                while b"\r\n.\r\n" not in self.buf:
+                    keep = self.buf[-4:]
+                    size += len(self.buf) - len(keep)
+                    if size > MAX_BYTES:
+                        raise ValueError("message too large")
+                    data = self.conn.recv(65536)
+                    if not data:
+                        raise EOFError
+                    self.buf = keep + data
+                head, self.buf = self.buf.split(b"\r\n.\r\n", 1)
+                return size + len(head)
+
+
+        def handle(conn):
+            ev = {"at": int(time.time()), "src": None, "tls": None, "cipher": None,
+                  "ehlo": None, "messages": [], "end": "open"}
+            try:
+                conn.settimeout(120)
+                s = Session(conn)
+                match = PROXY.match(s.line())
+                if not match:
+                    ev["end"] = "no proxy header"
+                    return
+                ev["src"] = match.group(1).decode()
+                s.send(f"220 {HOST} ESMTP")
+                rcpt = 0
+                while True:
+                    line = s.line()
+                    verb = line[:10].split(b" ")[0].upper()
+                    if verb in (b"EHLO", b"HELO"):
+                        ev["ehlo"] = line[5:69].decode("ascii", "replace")
+                        if ev["tls"]:
+                            s.send(f"250-{HOST}\r\n250 SIZE {MAX_BYTES}")
+                        else:
+                            s.send(f"250-{HOST}\r\n250-SIZE {MAX_BYTES}\r\n250 STARTTLS")
+                    elif verb == b"STARTTLS" and not ev["tls"]:
+                        s.send("220 go ahead")
+                        s.buf = b""
+                        conn = tls.wrap_socket(conn, server_side=True)
+                        s.conn = conn
+                        ev["tls"], ev["cipher"] = conn.version(), conn.cipher()[0]
+                    elif verb == b"NOOP":
+                        s.send("250 ok")
+                    elif verb == b"RSET":
+                        rcpt = 0
+                        s.send("250 ok")
+                    elif verb == b"QUIT":
+                        s.send("221 bye")
+                        ev["end"] = "quit"
+                        return
+                    elif verb in (b"MAIL", b"RCPT", b"DATA") and not ev["tls"]:
+                        s.send("530 5.7.0 Must issue a STARTTLS command first")
+                        ev["end"] = "refused plaintext"
+                    elif verb == b"MAIL":
+                        rcpt = 0
+                        s.send("250 ok")
+                    elif verb == b"RCPT":
+                        if DOMAIN.encode() + b">" in line.lower():
+                            rcpt += 1
+                            s.send("250 ok")
+                        else:
+                            s.send("550 5.1.1 no such user")
+                    elif verb == b"DATA":
+                        if not rcpt:
+                            s.send("503 need RCPT")
+                            continue
+                        s.send("354 end with <CRLF>.<CRLF>")
+                        ev["messages"].append(s.body())
+                        s.send("250 accepted and discarded")
+                    else:
+                        s.send("502 not implemented")
+            except (EOFError, OSError, ValueError, ssl.SSLError) as err:
+                if ev["end"] == "open":
+                    ev["end"] = type(err).__name__
+            finally:
+                conn.close()
+                slots.release()
+                with lock:
+                    events.append(ev)
+
 
         def smtp():
-            server = socket.create_server(("0.0.0.0", 25))
+            server = socket.create_server(("0.0.0.0", 2525), backlog=64)
             while True:
-                conn, peer = server.accept()
-                print("port 25 connection from", peer[0])
-                conn.sendall(f"220 port25-probe peer={peer[0]}\r\n".encode())
-                conn.close()
+                conn, _ = server.accept()
+                if slots.acquire(blocking=False):
+                    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+                else:
+                    conn.close()
 
-        class Health(BaseHTTPRequestHandler):
+
+        class Http(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
             def do_GET(self):
+                body = b"ok\n"
+                if self.server.server_port == 8081 and self.path == "/recent":
+                    with lock:
+                        body = json.dumps({"booted": int(BOOTED), "events": list(events)}, indent=1).encode()
                 self.send_response(200)
                 self.end_headers()
-                self.wfile.write(b"ok\n")
+                self.wfile.write(body)
+
 
         threading.Thread(target=smtp, daemon=True).start()
-        HTTPServer(("0.0.0.0", 8080), Health).serve_forever()
+        threading.Thread(target=ThreadingHTTPServer(("0.0.0.0", 8081), Http).serve_forever, daemon=True).start()
+        ThreadingHTTPServer(("0.0.0.0", 8080), Http).serve_forever()
 
 shim:
   upstream-port: 8080
