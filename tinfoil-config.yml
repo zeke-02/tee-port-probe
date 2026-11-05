@@ -1,19 +1,27 @@
-# Update test release.
-# Probe: does real internet mail reach an enclave through a gateway and tunnel?
+# Probe: can an enclave get a public TLS certificate for an attested key and serve SMTP with it?
 # Holds no secrets. Accepts mail for fountbox.com, discards it, and keeps only
-# connection metadata in memory. /recent is reachable only through the tunnel.
+# connection metadata in memory. /recent and /status are reachable only through the tunnel.
 cvm-version: 0.14.17
 cpus: 2
 memory: 8192
 
+attested-keys:
+  - id: mail-tls
+    key: ecdsa-p256
+
 networks:
-  probe: {}
+  probe:
+    egress: allowlist
+    allow:
+      - acme-staging-v02.api.letsencrypt.org
+      - acme-v02.api.letsencrypt.org
 
 containers:
   - name: "probe"
     image: "docker.io/library/python:3.13-slim@sha256:09a17cad02668ae61ece136b4fd36ac3849e14f670ebedb637ea3e15580525bc"
     networks: [probe]
-    ports: ["2525:2525", "8081:8081"]
+    keys: [mail-tls]
+    ports: ["2525:2525", "8081:8081", "8088:8088"]
     tmpfs:
       /tmp: "size=16m"
     entrypoint:
@@ -21,8 +29,10 @@ containers:
       - -u
       - -c
       - |
-        import collections, json, re, socket, ssl, subprocess, threading, time
+        import base64, collections, hashlib, json, os, re, socket, ssl, subprocess, threading, time
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from urllib.error import HTTPError
+        from urllib.request import Request, urlopen
 
         HOST = "mx.fountbox.com"
         DOMAIN = "@fountbox.com"
@@ -34,15 +44,135 @@ containers:
         lock = threading.Lock()
         slots = threading.BoundedSemaphore(50)
 
-        subprocess.run(
-            ["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
-             "-nodes", "-keyout", "/tmp/key.pem", "-out", "/tmp/cert.pem", "-days", "7",
-             "-subj", f"/CN={HOST}", "-addext", f"subjectAltName=DNS:{HOST}"],
-            check=True, capture_output=True,
-        )
-        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        tls.minimum_version = ssl.TLSVersion.TLSv1_2
-        tls.load_cert_chain("/tmp/cert.pem", "/tmp/key.pem")
+        ACME = os.environ.get("ACME_DIRECTORY", "https://acme-staging-v02.api.letsencrypt.org/directory")
+        KEY_DIR = os.environ.get("KEY_DIR", "/run/tinfoil/keys/mail-tls")
+        KEY = f"{KEY_DIR}/private_key.pem"
+        PUB = f"{KEY_DIR}/public_key.pem"
+        ACCOUNT = "/tmp/account.pem"
+        CHAIN = "/tmp/fullchain.pem"
+
+        tls = None
+        reachable = threading.Event()
+        challenges = {}
+        status = {"state": "waiting", "acme": ACME, "booted": BOOTED, "reachable_at": None,
+                  "issued_at": None, "attempts": 0, "errors": [], "serial": None,
+                  "attested_spki_sha256": None, "cert_spki_sha256": None, "key_matches": None,
+                  "attested_public_pem": None}
+
+
+        def run(*args, data=None):
+            return subprocess.run(args, input=data, check=True, capture_output=True).stdout
+
+
+        def b64(data):
+            return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+        class Acme:
+            def __init__(self):
+                run("openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", ACCOUNT)
+                point = run("openssl", "ec", "-in", ACCOUNT, "-pubout", "-outform", "DER")[-64:]
+                self.jwk = {"crv": "P-256", "kty": "EC", "x": b64(point[:32]), "y": b64(point[32:])}
+                canonical = json.dumps(self.jwk, sort_keys=True, separators=(",", ":")).encode()
+                self.thumbprint = b64(hashlib.sha256(canonical).digest())
+                self.urls = json.load(urlopen(ACME, timeout=30))
+                self.kid = self.nonce = None
+
+            def fresh_nonce(self):
+                req = Request(self.urls["newNonce"], method="HEAD")
+                with urlopen(req, timeout=30) as res:
+                    return res.headers["Replay-Nonce"]
+
+            def sign(self, data):
+                der = run("openssl", "dgst", "-sha256", "-sign", ACCOUNT, data=data)
+                r_len = der[3]
+                r, s = der[4:4 + r_len], der[6 + r_len:]
+                return b"".join(int.from_bytes(n, "big").to_bytes(32, "big") for n in (r, s))
+
+            def post(self, url, payload):
+                for _ in range(3):
+                    head = {"alg": "ES256", "nonce": self.nonce or self.fresh_nonce(), "url": url}
+                    head.update({"kid": self.kid} if self.kid else {"jwk": self.jwk})
+                    self.nonce = None
+                    protected = b64(json.dumps(head).encode())
+                    body = "" if payload is None else b64(json.dumps(payload).encode())
+                    jws = {"protected": protected, "payload": body,
+                           "signature": b64(self.sign(f"{protected}.{body}".encode()))}
+                    req = Request(url, json.dumps(jws).encode(), {"Content-Type": "application/jose+json"})
+                    try:
+                        with urlopen(req, timeout=30) as res:
+                            self.nonce = res.headers["Replay-Nonce"]
+                            return res.headers, res.read()
+                    except HTTPError as err:
+                        self.nonce = err.headers.get("Replay-Nonce")
+                        text = err.read()
+                        if b"badNonce" not in text:
+                            raise RuntimeError(f"{url} {err.code} {text[:500]!r}")
+                raise RuntimeError(f"{url} kept returning badNonce")
+
+            def wait_valid(self, url):
+                for _ in range(60):
+                    doc = json.loads(self.post(url, None)[1])
+                    if doc["status"] == "valid":
+                        return doc
+                    if doc["status"] == "invalid":
+                        raise RuntimeError(json.dumps(doc)[:800])
+                    time.sleep(1)
+                raise RuntimeError(f"timed out on {url}")
+
+
+        def spki_sha256(pem):
+            der = run("openssl", "pkey", "-pubin", "-outform", "DER", data=pem)
+            return hashlib.sha256(der).hexdigest()
+
+
+        def issue():
+            global tls
+            acme = Acme()
+            acme.kid = acme.post(acme.urls["newAccount"], {"termsOfServiceAgreed": True})[0]["Location"]
+            headers, body = acme.post(acme.urls["newOrder"],
+                                      {"identifiers": [{"type": "dns", "value": HOST}]})
+            order_url, order = headers["Location"], json.loads(body)
+            for authz in order["authorizations"]:
+                doc = json.loads(acme.post(authz, None)[1])
+                challenge = next(c for c in doc["challenges"] if c["type"] == "http-01")
+                challenges[challenge["token"]] = f"{challenge['token']}.{acme.thumbprint}"
+                acme.post(challenge["url"], {})
+                acme.wait_valid(authz)
+            csr = run("openssl", "req", "-new", "-key", KEY, "-subj", f"/CN={HOST}",
+                      "-addext", f"subjectAltName=DNS:{HOST}", "-outform", "DER")
+            acme.post(order["finalize"], {"csr": b64(csr)})
+            chain = acme.post(acme.wait_valid(order_url)["certificate"], None)[1]
+            with open(CHAIN, "wb") as out:
+                out.write(chain)
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ctx.load_cert_chain(CHAIN, KEY)
+            tls = ctx
+            public = run("openssl", "x509", "-in", CHAIN, "-pubkey", "-noout")
+            status["cert_spki_sha256"] = spki_sha256(public)
+            status["serial"] = run("openssl", "x509", "-in", CHAIN, "-serial", "-noout").decode().strip()
+            status["key_matches"] = status["cert_spki_sha256"] == status["attested_spki_sha256"]
+            status["issued_at"] = time.time()
+            status["state"] = "ready"
+
+
+        def certificates():
+            with open(PUB, "rb") as src:
+                pem = src.read()
+            status["attested_public_pem"] = pem.decode()
+            status["attested_spki_sha256"] = spki_sha256(pem)
+            reachable.wait()
+            status["reachable_at"] = time.time()
+            while status["attempts"] < 4:
+                status["attempts"] += 1
+                status["state"] = "issuing"
+                try:
+                    return issue()
+                except Exception as err:
+                    status["errors"].append(f"{type(err).__name__}: {err}"[:1000])
+                    status["state"] = "failed"
+                    time.sleep(180)
 
 
         class Session:
@@ -89,6 +219,10 @@ containers:
                     ev["end"] = "no proxy header"
                     return
                 ev["src"] = match.group(1).decode()
+                if tls is None:
+                    s.send(f"421 4.3.2 {HOST} certificate not ready")
+                    ev["end"] = "no certificate yet"
+                    return
                 s.send(f"220 {HOST} ESMTP")
                 rcpt = 0
                 while True:
@@ -161,17 +295,29 @@ containers:
                 pass
 
             def do_GET(self):
+                port = self.server.server_port
                 body = b"ok\n"
-                if self.server.server_port == 8081 and self.path == "/recent":
+                code = 200
+                if port == 8081 and self.path == "/recent":
                     with lock:
                         body = json.dumps({"booted": int(BOOTED), "events": list(events)}, indent=1).encode()
-                self.send_response(200)
+                elif port == 8081 and self.path == "/status":
+                    body = json.dumps(status, indent=1).encode()
+                elif port == 8088:
+                    reachable.set()
+                    token = self.path.rsplit("/", 1)[-1]
+                    if self.path.startswith("/.well-known/acme-challenge/"):
+                        body = challenges.get(token, "").encode()
+                        code = 200 if body else 404
+                self.send_response(code)
                 self.end_headers()
                 self.wfile.write(body)
 
 
         threading.Thread(target=smtp, daemon=True).start()
+        threading.Thread(target=certificates, daemon=True).start()
         threading.Thread(target=ThreadingHTTPServer(("0.0.0.0", 8081), Http).serve_forever, daemon=True).start()
+        threading.Thread(target=ThreadingHTTPServer(("0.0.0.0", 8088), Http).serve_forever, daemon=True).start()
         ThreadingHTTPServer(("0.0.0.0", 8080), Http).serve_forever()
 
 shim:
