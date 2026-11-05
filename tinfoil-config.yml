@@ -15,6 +15,7 @@ containers:
     image: "docker.io/library/python:3.13-alpine@sha256:7984cf56ceaddebe4fefeb75d64000b9f45d8b77b11a09b24524da6cdc3af0c8"
     networks: [probe]
     ports: ["25:25"]
+    cvm_admin: true
     cap_add: [NET_BIND_SERVICE]
     entrypoint:
       - python
