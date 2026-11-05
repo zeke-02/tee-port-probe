@@ -1,3 +1,4 @@
+# Update test release.
 # Probe: does real internet mail reach an enclave through a gateway and tunnel?
 # Holds no secrets. Accepts mail for fountbox.com, discards it, and keeps only
 # connection metadata in memory. /recent is reachable only through the tunnel.
