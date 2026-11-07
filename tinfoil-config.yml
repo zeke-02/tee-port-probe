@@ -1,327 +1,84 @@
-# Probe: can an enclave get a public TLS certificate for an attested key and serve SMTP with it?
-# Holds no secrets. Accepts mail for fountbox.com, discards it, and keeps only
-# connection metadata in memory. /recent and /status are reachable only through the tunnel.
+# Throwaway probe for Fount Mail gap 1.10. Does S3 stay reachable through Tinfoil's
+# hostname allowlist while its IPs rotate? Holds no secrets and stores no data. An
+# unsigned request answers 403, which still proves the connection got through.
 cvm-version: 0.14.17
 cpus: 2
 memory: 8192
-
-attested-keys:
-  - id: mail-tls
-    key: ecdsa-p256
 
 networks:
   probe:
     egress: allowlist
     allow:
-      - acme-staging-v02.api.letsencrypt.org
-      - acme-v02.api.letsencrypt.org
+      - fount-mail-063207099341.s3.us-east-1.amazonaws.com
+      - fount-mail-bootlog-063207099341.s3.us-east-1.amazonaws.com
+      - fount-mail-routing-backup-063207099341.s3.us-east-1.amazonaws.com
 
 containers:
   - name: "probe"
     image: "docker.io/library/python:3.13-slim@sha256:09a17cad02668ae61ece136b4fd36ac3849e14f670ebedb637ea3e15580525bc"
     networks: [probe]
-    keys: [mail-tls]
-    ports: ["2525:2525", "8081:8081", "8088:8088"]
-    tmpfs:
-      /tmp: "size=16m"
+    ports: ["8080:8080"]
     entrypoint:
       - python
       - -u
       - -c
       - |
-        import base64, collections, hashlib, json, os, re, socket, ssl, subprocess, threading, time
+        import collections, http.client, json, socket, threading, time
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-        from urllib.error import HTTPError
-        from urllib.request import Request, urlopen
 
-        HOST = "mx.fountbox.com"
-        DOMAIN = "@fountbox.com"
-        MAX_BYTES = 25 * 1024 * 1024
+        HOSTS = ["fount-mail-063207099341.s3.us-east-1.amazonaws.com",
+                 "fount-mail-bootlog-063207099341.s3.us-east-1.amazonaws.com",
+                 "fount-mail-routing-backup-063207099341.s3.us-east-1.amazonaws.com"]
         BOOTED = time.time()
-        PROXY = re.compile(rb"^PROXY (?:TCP4|TCP6) (\S+) (\S+) \d+ \d+$")
-
-        events = collections.deque(maxlen=200)
         lock = threading.Lock()
-        slots = threading.BoundedSemaphore(50)
+        stats = {h: {"ok": 0, "failed": 0, "statuses": {}, "ips": collections.Counter(), "failed_ips": collections.Counter()} for h in HOSTS}
+        errors = collections.deque(maxlen=40)
 
-        ACME = os.environ.get("ACME_DIRECTORY", "https://acme-v02.api.letsencrypt.org/directory")
-        KEY_DIR = os.environ.get("KEY_DIR", "/run/tinfoil/keys/mail-tls")
-        KEY = f"{KEY_DIR}/private_key.pem"
-        PUB = f"{KEY_DIR}/public_key.pem"
-        ACCOUNT = "/tmp/account.pem"
-        CHAIN = "/tmp/fullchain.pem"
-
-        tls = None
-        reachable = threading.Event()
-        challenges = {}
-        status = {"state": "waiting", "acme": ACME, "booted": BOOTED, "reachable_at": None,
-                  "issued_at": None, "attempts": 0, "errors": [], "serial": None,
-                  "attested_spki_sha256": None, "cert_spki_sha256": None, "key_matches": None,
-                  "attested_public_pem": None}
-
-
-        def run(*args, data=None):
-            return subprocess.run(args, input=data, check=True, capture_output=True).stdout
-
-
-        def b64(data):
-            return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
-
-
-        class Acme:
-            def __init__(self):
-                run("openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", ACCOUNT)
-                point = run("openssl", "ec", "-in", ACCOUNT, "-pubout", "-outform", "DER")[-64:]
-                self.jwk = {"crv": "P-256", "kty": "EC", "x": b64(point[:32]), "y": b64(point[32:])}
-                canonical = json.dumps(self.jwk, sort_keys=True, separators=(",", ":")).encode()
-                self.thumbprint = b64(hashlib.sha256(canonical).digest())
-                self.urls = json.load(urlopen(ACME, timeout=30))
-                self.kid = self.nonce = None
-
-            def fresh_nonce(self):
-                req = Request(self.urls["newNonce"], method="HEAD")
-                with urlopen(req, timeout=30) as res:
-                    return res.headers["Replay-Nonce"]
-
-            def sign(self, data):
-                der = run("openssl", "dgst", "-sha256", "-sign", ACCOUNT, data=data)
-                r_len = der[3]
-                r, s = der[4:4 + r_len], der[6 + r_len:]
-                return b"".join(int.from_bytes(n, "big").to_bytes(32, "big") for n in (r, s))
-
-            def post(self, url, payload):
-                for _ in range(3):
-                    head = {"alg": "ES256", "nonce": self.nonce or self.fresh_nonce(), "url": url}
-                    head.update({"kid": self.kid} if self.kid else {"jwk": self.jwk})
-                    self.nonce = None
-                    protected = b64(json.dumps(head).encode())
-                    body = "" if payload is None else b64(json.dumps(payload).encode())
-                    jws = {"protected": protected, "payload": body,
-                           "signature": b64(self.sign(f"{protected}.{body}".encode()))}
-                    req = Request(url, json.dumps(jws).encode(), {"Content-Type": "application/jose+json"})
-                    try:
-                        with urlopen(req, timeout=30) as res:
-                            self.nonce = res.headers["Replay-Nonce"]
-                            return res.headers, res.read()
-                    except HTTPError as err:
-                        self.nonce = err.headers.get("Replay-Nonce")
-                        text = err.read()
-                        if b"badNonce" not in text:
-                            raise RuntimeError(f"{url} {err.code} {text[:500]!r}")
-                raise RuntimeError(f"{url} kept returning badNonce")
-
-            def wait_valid(self, url):
-                for _ in range(60):
-                    doc = json.loads(self.post(url, None)[1])
-                    if doc["status"] == "valid":
-                        return doc
-                    if doc["status"] == "invalid":
-                        raise RuntimeError(json.dumps(doc)[:800])
-                    time.sleep(1)
-                raise RuntimeError(f"timed out on {url}")
-
-
-        def spki_sha256(pem):
-            der = run("openssl", "pkey", "-pubin", "-outform", "DER", data=pem)
-            return hashlib.sha256(der).hexdigest()
-
-
-        def issue():
-            global tls
-            acme = Acme()
-            acme.kid = acme.post(acme.urls["newAccount"], {"termsOfServiceAgreed": True})[0]["Location"]
-            headers, body = acme.post(acme.urls["newOrder"],
-                                      {"identifiers": [{"type": "dns", "value": HOST}]})
-            order_url, order = headers["Location"], json.loads(body)
-            for authz in order["authorizations"]:
-                doc = json.loads(acme.post(authz, None)[1])
-                challenge = next(c for c in doc["challenges"] if c["type"] == "http-01")
-                challenges[challenge["token"]] = f"{challenge['token']}.{acme.thumbprint}"
-                acme.post(challenge["url"], {})
-                acme.wait_valid(authz)
-            csr = run("openssl", "req", "-new", "-key", KEY, "-subj", f"/CN={HOST}",
-                      "-addext", f"subjectAltName=DNS:{HOST}", "-outform", "DER")
-            acme.post(order["finalize"], {"csr": b64(csr)})
-            chain = acme.post(acme.wait_valid(order_url)["certificate"], None)[1]
-            with open(CHAIN, "wb") as out:
-                out.write(chain)
-            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-            ctx.load_cert_chain(CHAIN, KEY)
-            tls = ctx
-            public = run("openssl", "x509", "-in", CHAIN, "-pubkey", "-noout")
-            status["cert_spki_sha256"] = spki_sha256(public)
-            status["serial"] = run("openssl", "x509", "-in", CHAIN, "-serial", "-noout").decode().strip()
-            status["key_matches"] = status["cert_spki_sha256"] == status["attested_spki_sha256"]
-            status["issued_at"] = time.time()
-            status["state"] = "ready"
-
-
-        def certificates():
-            with open(PUB, "rb") as src:
-                pem = src.read()
-            status["attested_public_pem"] = pem.decode()
-            status["attested_spki_sha256"] = spki_sha256(pem)
-            reachable.wait()
-            status["reachable_at"] = time.time()
-            time.sleep(15)
-            while status["attempts"] < 4:
-                status["attempts"] += 1
-                status["state"] = "issuing"
-                try:
-                    return issue()
-                except Exception as err:
-                    status["errors"].append(f"{type(err).__name__}: {err}"[:1000])
-                    status["state"] = "failed"
-                    time.sleep(180)
-
-
-        class Session:
-            def __init__(self, conn):
-                self.conn, self.buf = conn, b""
-
-            def line(self):
-                while b"\r\n" not in self.buf:
-                    if len(self.buf) > 8192:
-                        raise ValueError("line too long")
-                    data = self.conn.recv(4096)
-                    if not data:
-                        raise EOFError
-                    self.buf += data
-                out, self.buf = self.buf.split(b"\r\n", 1)
-                return out
-
-            def send(self, text):
-                self.conn.sendall(text.encode() + b"\r\n")
-
-            def body(self):
-                size = 0
-                while b"\r\n.\r\n" not in self.buf:
-                    keep = self.buf[-4:]
-                    size += len(self.buf) - len(keep)
-                    if size > MAX_BYTES:
-                        raise ValueError("message too large")
-                    data = self.conn.recv(65536)
-                    if not data:
-                        raise EOFError
-                    self.buf = keep + data
-                head, self.buf = self.buf.split(b"\r\n.\r\n", 1)
-                return size + len(head)
-
-
-        def handle(conn):
-            ev = {"at": int(time.time()), "src": None, "tls": None, "cipher": None,
-                  "ehlo": None, "messages": [], "end": "open"}
+        def attempt(host):
+            ip = None
             try:
-                conn.settimeout(120)
-                s = Session(conn)
-                match = PROXY.match(s.line())
-                if not match:
-                    ev["end"] = "no proxy header"
-                    return
-                ev["src"] = match.group(1).decode()
-                if tls is None:
-                    s.send(f"421 4.3.2 {HOST} certificate not ready")
-                    ev["end"] = "no certificate yet"
-                    return
-                s.send(f"220 {HOST} ESMTP")
-                rcpt = 0
-                while True:
-                    line = s.line()
-                    verb = line[:10].split(b" ")[0].upper()
-                    if verb in (b"EHLO", b"HELO"):
-                        ev["ehlo"] = line[5:69].decode("ascii", "replace")
-                        if ev["tls"]:
-                            s.send(f"250-{HOST}\r\n250 SIZE {MAX_BYTES}")
-                        else:
-                            s.send(f"250-{HOST}\r\n250-SIZE {MAX_BYTES}\r\n250 STARTTLS")
-                    elif verb == b"STARTTLS" and not ev["tls"]:
-                        s.send("220 go ahead")
-                        s.buf = b""
-                        conn = tls.wrap_socket(conn, server_side=True)
-                        s.conn = conn
-                        ev["tls"], ev["cipher"] = conn.version(), conn.cipher()[0]
-                    elif verb == b"NOOP":
-                        s.send("250 ok")
-                    elif verb == b"RSET":
-                        rcpt = 0
-                        s.send("250 ok")
-                    elif verb == b"QUIT":
-                        s.send("221 bye")
-                        ev["end"] = "quit"
-                        return
-                    elif verb in (b"MAIL", b"RCPT", b"DATA") and not ev["tls"]:
-                        s.send("530 5.7.0 Must issue a STARTTLS command first")
-                        ev["end"] = "refused plaintext"
-                    elif verb == b"MAIL":
-                        rcpt = 0
-                        s.send("250 ok")
-                    elif verb == b"RCPT":
-                        if DOMAIN.encode() + b">" in line.lower():
-                            rcpt += 1
-                            s.send("250 ok")
-                        else:
-                            s.send("550 5.1.1 no such user")
-                    elif verb == b"DATA":
-                        if not rcpt:
-                            s.send("503 need RCPT")
-                            continue
-                        s.send("354 end with <CRLF>.<CRLF>")
-                        ev["messages"].append(s.body())
-                        s.send("250 accepted and discarded")
-                    else:
-                        s.send("502 not implemented")
-            except (EOFError, OSError, ValueError, ssl.SSLError) as err:
-                if ev["end"] == "open":
-                    ev["end"] = type(err).__name__
-            finally:
-                conn.close()
-                slots.release()
+                ip = socket.gethostbyname(host)
+                c = http.client.HTTPSConnection(host, timeout=8)
+                c.request("HEAD", "/")
+                status = c.getresponse().status
+                c.close()
                 with lock:
-                    events.append(ev)
+                    s = stats[host]
+                    s["ok"] += 1
+                    s["ips"][ip] += 1
+                    s["statuses"][str(status)] = s["statuses"].get(str(status), 0) + 1
+            except Exception as e:
+                with lock:
+                    s = stats[host]
+                    s["failed"] += 1
+                    if ip:
+                        s["failed_ips"][ip] += 1
+                    errors.append([round(time.time() - BOOTED), host.split(".")[0], ip, type(e).__name__, str(e)[:100]])
 
-
-        def smtp():
-            server = socket.create_server(("0.0.0.0", 2525), backlog=64)
+        def loop():
             while True:
-                conn, _ = server.accept()
-                if slots.acquire(blocking=False):
-                    threading.Thread(target=handle, args=(conn,), daemon=True).start()
-                else:
-                    conn.close()
+                for h in HOSTS:
+                    attempt(h)
+                time.sleep(2)
 
-
-        class Http(BaseHTTPRequestHandler):
-            def log_message(self, *args):
-                pass
-
+        class H(BaseHTTPRequestHandler):
             def do_GET(self):
-                port = self.server.server_port
-                body = b"ok\n"
-                code = 200
-                if port == 8081 and self.path == "/recent":
-                    with lock:
-                        body = json.dumps({"booted": int(BOOTED), "events": list(events)}, indent=1).encode()
-                elif port == 8081 and self.path == "/status":
-                    body = json.dumps(status, indent=1).encode()
-                elif port == 8088:
-                    reachable.set()
-                    token = self.path.rsplit("/", 1)[-1]
-                    if self.path.startswith("/.well-known/acme-challenge/"):
-                        body = challenges.get(token, "").encode()
-                        code = 200 if body else 404
-                self.send_response(code)
+                with lock:
+                    body = json.dumps({"uptime_s": round(time.time() - BOOTED), "hosts": {
+                        h.split(".")[0]: {"ok": s["ok"], "failed": s["failed"], "statuses": s["statuses"],
+                                          "distinct_ips": len(s["ips"]), "failed_ips": len(s["failed_ips"])}
+                        for h, s in stats.items()}, "errors": list(errors)}, indent=1).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(body)
+            def log_message(self, *a):
+                pass
 
-
-        threading.Thread(target=smtp, daemon=True).start()
-        threading.Thread(target=certificates, daemon=True).start()
-        threading.Thread(target=ThreadingHTTPServer(("0.0.0.0", 8081), Http).serve_forever, daemon=True).start()
-        threading.Thread(target=ThreadingHTTPServer(("0.0.0.0", 8088), Http).serve_forever, daemon=True).start()
-        ThreadingHTTPServer(("0.0.0.0", 8080), Http).serve_forever()
+        threading.Thread(target=loop, daemon=True).start()
+        ThreadingHTTPServer(("0.0.0.0", 8080), H).serve_forever()
 
 shim:
   upstream-port: 8080
   paths:
-    - /health
+    - /status
