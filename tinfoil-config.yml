@@ -1,99 +1,89 @@
-# Throwaway probe for Fount Mail gap 1.10, second design. Can a container with no
-# egress reach S3 through a small forwarder on an open network? Stores no data. An
-# unsigned request answers 403, which still proves the connection got through.
+# Throwaway probe for the Fount Mail container split and the non-AWS relay. Holds no
+# secrets and stores no data. Two questions:
 #
-# PROBE_SECRET is a random dummy declared on the client only. Each container reports
-# whether it can see it, never its value.
+#   1. Does the enclave accept a tunnel to a port published by a container whose only
+#      network is `closed`? `front` is on `frontlink` alone and publishes 2525.
+#      Test: tinfoil forward netprobe -L 2525:2525, then nc localhost 2525.
+#   2. Does `allowlist` egress reach non-AWS hosts on 443? `back` loops TLS
+#      handshakes to an OVH and a Hetzner host (where the relay VM would live) and
+#      reports them on /status.
 cvm-version: 0.14.17
 cpus: 2
-memory: 8192
+memory: 4096
 
 networks:
-  internal: {}
-  storage:
-    egress: open
+  frontlink: {}
+  out:
+    egress: allowlist
+    allow:
+      - www.ovhcloud.com
+      - www.hetzner.com
 
 containers:
-  - name: "client"
+  - name: "back"
     image: "docker.io/library/python:3.13-slim@sha256:09a17cad02668ae61ece136b4fd36ac3849e14f670ebedb637ea3e15580525bc"
-    networks: [internal]
+    networks: [frontlink, out]
     ports: ["8080:8080"]
-    secrets:
-      - PROBE_SECRET
     entrypoint:
       - python
       - -u
       - -c
       - |
-        import collections, http.client, json, os, socket, ssl, threading, time, urllib.request
+        import collections, json, socket, socketserver, ssl, threading, time
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-        ROUTES = {9001: "fount-mail-063207099341.s3.us-east-1.amazonaws.com",
-                  9002: "fount-mail-bootlog-063207099341.s3.us-east-1.amazonaws.com",
-                  9003: "fount-mail-routing-backup-063207099341.s3.us-east-1.amazonaws.com"}
+        HOSTS = ["www.ovhcloud.com", "www.hetzner.com"]
         BOOTED = time.time()
         lock = threading.Lock()
         tls = ssl.create_default_context()
-        stats = {h: {"ok": 0, "failed": 0, "statuses": {}, "max_s": 0.0} for h in ROUTES.values()}
-        isolation = {"direct_reached": 0, "direct_failed": 0, "last_error": ""}
+        egress = {h: {"ok": 0, "failed": 0, "max_s": 0.0} for h in HOSTS}
+        control = {"reached": 0, "failed": 0}
         errors = collections.deque(maxlen=40)
+        link = {"connections_from_front": 0}
 
-        def attempt(port, host):
+        def handshake(host):
             start = time.time()
-            try:
-                raw = socket.create_connection(("forwarder", port), timeout=30)
-                wrapped = tls.wrap_socket(raw, server_hostname=host)
-                c = http.client.HTTPConnection(host, timeout=30)
-                c.sock = wrapped
-                c.request("HEAD", "/")
-                status = c.getresponse().status
-                c.close()
-                with lock:
-                    s = stats[host]
-                    s["ok"] += 1
-                    s["statuses"][str(status)] = s["statuses"].get(str(status), 0) + 1
-                    s["max_s"] = max(s["max_s"], round(time.time() - start, 2))
-            except Exception as e:
-                with lock:
-                    stats[host]["failed"] += 1
-                    errors.append([round(time.time() - BOOTED), host.split(".")[0], type(e).__name__, str(e)[:100]])
+            with socket.create_connection((host, 443), timeout=10) as raw:
+                with tls.wrap_socket(raw, server_hostname=host):
+                    pass
+            return round(time.time() - start, 2)
 
         def loop():
             while True:
-                for port, host in ROUTES.items():
-                    attempt(port, host)
-                time.sleep(2)
-
-        def direct_check():
-            host = ROUTES[9001]
-            while True:
+                for h in HOSTS:
+                    try:
+                        took = handshake(h)
+                        with lock:
+                            egress[h]["ok"] += 1
+                            egress[h]["max_s"] = max(egress[h]["max_s"], took)
+                    except Exception as e:
+                        with lock:
+                            egress[h]["failed"] += 1
+                            errors.append([round(time.time() - BOOTED), h, type(e).__name__, str(e)[:100]])
+                # A host off the allowlist must fail, or the allowlist proves nothing.
                 try:
-                    socket.create_connection((host, 443), timeout=5).close()
+                    handshake("www.debian.org")
                     with lock:
-                        isolation["direct_reached"] += 1
-                except Exception as e:
+                        control["reached"] += 1
+                except Exception:
                     with lock:
-                        isolation["direct_failed"] += 1
-                        isolation["last_error"] = type(e).__name__ + ": " + str(e)[:80]
-                time.sleep(60)
+                        control["failed"] += 1
+                time.sleep(5)
 
-        def forwarder_status():
-            try:
-                with urllib.request.urlopen("http://forwarder:8081/status", timeout=5) as r:
-                    return json.load(r)
-            except Exception as e:
-                return {"unreachable": type(e).__name__ + ": " + str(e)[:100]}
+        class Link(socketserver.BaseRequestHandler):
+            def handle(self):
+                with lock:
+                    link["connections_from_front"] += 1
+                self.request.sendall(b"back ok\n")
 
         class H(BaseHTTPRequestHandler):
             def do_GET(self):
-                forwarder = forwarder_status()
                 with lock:
                     body = json.dumps({"uptime_s": round(time.time() - BOOTED),
-                                       "client_sees_probe_secret": "PROBE_SECRET" in os.environ,
-                                       "client_direct_to_s3": isolation,
-                                       "through_forwarder": {h.split(".")[0]: s for h, s in stats.items()},
-                                       "errors": list(errors),
-                                       "forwarder": forwarder}, indent=1).encode()
+                                       "egress_443": egress,
+                                       "off_allowlist_control": control,
+                                       "link": link,
+                                       "errors": list(errors)}, indent=1).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -102,128 +92,42 @@ containers:
                 pass
 
         threading.Thread(target=loop, daemon=True).start()
-        threading.Thread(target=direct_check, daemon=True).start()
+        threading.Thread(target=socketserver.ThreadingTCPServer(("0.0.0.0", 7000), Link).serve_forever, daemon=True).start()
         ThreadingHTTPServer(("0.0.0.0", 8080), H).serve_forever()
 
-  - name: "forwarder"
+  - name: "front"
     image: "docker.io/library/python:3.13-slim@sha256:09a17cad02668ae61ece136b4fd36ac3849e14f670ebedb637ea3e15580525bc"
-    networks: [internal, storage]
-    restart: always
+    networks: [frontlink]
+    ports: ["2525:2525"]
     entrypoint:
       - python
       - -u
       - -c
       - |
-        import collections, http.client, json, os, random, socket, threading, time
-        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import socket, socketserver
 
-        ROUTES = {9001: "fount-mail-063207099341.s3.us-east-1.amazonaws.com",
-                  9002: "fount-mail-bootlog-063207099341.s3.us-east-1.amazonaws.com",
-                  9003: "fount-mail-routing-backup-063207099341.s3.us-east-1.amazonaws.com"}
-        BOOTED = time.time()
-        lock = threading.Lock()
-        relayed = {h: {"connections": 0, "first_try": 0, "later_try": 0, "exhausted": 0, "ips": collections.Counter()} for h in ROUTES.values()}
-        direct = {h: {"ok": 0, "failed": 0, "statuses": {}, "max_s": 0.0} for h in ROUTES.values()}
-        errors = collections.deque(maxlen=40)
-
-        def note(where, host, ip, e):
-            errors.append([round(time.time() - BOOTED), where, host.split(".")[0], ip, type(e).__name__, str(e)[:100]])
-
-        def dial(host):
-            addrs = list({a[4][0] for a in socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)})
-            random.shuffle(addrs)
-            for n, ip in enumerate(addrs):
-                try:
-                    up = socket.create_connection((ip, 443), timeout=5)
-                    up.settimeout(None)
-                    with lock:
-                        s = relayed[host]
-                        s["ips"][ip] += 1
-                        s["first_try" if n == 0 else "later_try"] += 1
-                    return up
-                except OSError as e:
-                    with lock:
-                        note("relay", host, ip, e)
-            raise OSError("no address connected")
-
-        def pump(src, dst):
+        def via_back():
             try:
-                while True:
-                    data = src.recv(65536)
-                    if not data:
-                        break
-                    dst.sendall(data)
-            except OSError:
-                pass
-            for s in (src, dst):
-                try:
-                    s.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
+                with socket.create_connection(("back", 7000), timeout=5) as s:
+                    return s.recv(64).decode().strip()
+            except Exception as e:
+                return "unreachable: " + type(e).__name__
 
-        def serve_conn(conn, host):
-            with lock:
-                relayed[host]["connections"] += 1
+        def direct():
             try:
-                up = dial(host)
-            except OSError as e:
-                with lock:
-                    relayed[host]["exhausted"] += 1
-                    note("relay", host, None, e)
-                conn.close()
-                return
-            threading.Thread(target=pump, args=(up, conn), daemon=True).start()
-            pump(conn, up)
+                socket.create_connection(("www.ovhcloud.com", 443), timeout=5).close()
+                return "REACHED (closed network leaked)"
+            except Exception as e:
+                return "blocked: " + type(e).__name__
 
-        def listen(port, host):
-            srv = socket.create_server(("0.0.0.0", port), backlog=64)
-            while True:
-                conn, _ = srv.accept()
-                threading.Thread(target=serve_conn, args=(conn, host), daemon=True).start()
+        class H(socketserver.BaseRequestHandler):
+            def handle(self):
+                self.request.sendall(("220 front ok; back=%s; direct_egress=%s\r\n" % (via_back(), direct())).encode())
 
-        def direct_loop():
-            while True:
-                for host in ROUTES.values():
-                    start = time.time()
-                    try:
-                        c = http.client.HTTPSConnection(host, timeout=8)
-                        c.request("HEAD", "/")
-                        status = c.getresponse().status
-                        c.close()
-                        with lock:
-                            s = direct[host]
-                            s["ok"] += 1
-                            s["statuses"][str(status)] = s["statuses"].get(str(status), 0) + 1
-                            s["max_s"] = max(s["max_s"], round(time.time() - start, 2))
-                    except Exception as e:
-                        with lock:
-                            direct[host]["failed"] += 1
-                            note("direct", host, None, e)
-                time.sleep(2)
-
-        class H(BaseHTTPRequestHandler):
-            def do_GET(self):
-                with lock:
-                    body = json.dumps({"uptime_s": round(time.time() - BOOTED),
-                                       "forwarder_sees_probe_secret": "PROBE_SECRET" in os.environ,
-                                       "tinfoil_mount_files": sorted(os.listdir("/tinfoil")) if os.path.isdir("/tinfoil") else [],
-                                       "relayed": {h.split(".")[0]: {**{k: v for k, v in s.items() if k != "ips"}, "distinct_ips": len(s["ips"])} for h, s in relayed.items()},
-                                       "direct": {h.split(".")[0]: s for h, s in direct.items()},
-                                       "errors": list(errors)}).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(body)
-            def log_message(self, *a):
-                pass
-
-        for port, host in ROUTES.items():
-            threading.Thread(target=listen, args=(port, host), daemon=True).start()
-        threading.Thread(target=direct_loop, daemon=True).start()
-        ThreadingHTTPServer(("0.0.0.0", 8081), H).serve_forever()
+        socketserver.ThreadingTCPServer(("0.0.0.0", 2525), H).serve_forever()
 
 shim:
   upstream-port: 8080
-  upstream-container: client
+  upstream-container: back
   paths:
     - /status
