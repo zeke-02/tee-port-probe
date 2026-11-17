@@ -1,0 +1,225 @@
+import hashlib, json, os, platform, subprocess, tarfile, tempfile, threading, time, urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+BOOTED = time.time()
+ARCH = {"x86_64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}[platform.machine()]
+RELEASE = "20261109.0"
+URL = f"https://storage.googleapis.com/gvisor/releases/release/{RELEASE}/{ARCH}/gvisor.tar.bz2"
+RUNSC = "/usr/local/bin/runsc"
+results = {"phase": "starting", "arch": ARCH}
+lock = threading.Lock()
+
+
+def put(key, value):
+    with lock:
+        results[key] = value
+
+
+def sh(args, timeout=120, **kw):
+    start = time.time()
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout, **kw)
+        return {"rc": p.returncode, "s": round(time.time() - start, 3),
+                "out": p.stdout[-1500:], "err": p.stderr[-1500:]}
+    except subprocess.TimeoutExpired:
+        return {"rc": "timeout", "s": round(time.time() - start, 3)}
+    except Exception as e:
+        return {"rc": "error", "err": f"{type(e).__name__}: {e}"}
+
+
+def read(path, limit=2000):
+    try:
+        with open(path) as f:
+            return f.read()[:limit]
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+
+
+def environment():
+    status = {line.split(":")[0]: line.split(":", 1)[1].strip()
+              for line in read("/proc/self/status", 10000).splitlines() if ":" in line}
+    cg = {"controllers": read("/sys/fs/cgroup/cgroup.controllers").strip(),
+          "subtree_control": read("/sys/fs/cgroup/cgroup.subtree_control").strip()}
+    try:
+        os.makedirs("/sys/fs/cgroup/probe-init", exist_ok=True)
+        for pid in read("/sys/fs/cgroup/cgroup.procs", 100000).split():
+            try:
+                with open("/sys/fs/cgroup/probe-init/cgroup.procs", "w") as f:
+                    f.write(pid)
+            except OSError:
+                pass
+        with open("/sys/fs/cgroup/cgroup.subtree_control", "w") as f:
+            f.write("+memory +pids +cpu")
+        cg["subtree_control_after"] = read("/sys/fs/cgroup/cgroup.subtree_control").strip()
+        os.makedirs("/sys/fs/cgroup/fount-probe", exist_ok=True)
+        with open("/sys/fs/cgroup/fount-probe/memory.max", "w") as f:
+            f.write("268435456")
+        cg["create_child_with_memory_max"] = read("/sys/fs/cgroup/fount-probe/memory.max").strip()
+        os.rmdir("/sys/fs/cgroup/fount-probe")
+    except Exception as e:
+        cg["create_child_with_memory_max"] = f"{type(e).__name__}: {e}"
+    kvm = os.path.exists("/dev/kvm")
+    try:
+        os.close(os.open("/dev/kvm", os.O_RDWR))
+        kvm_open = True
+    except Exception as e:
+        kvm_open = f"{type(e).__name__}: {e}"
+    flags = next((l for l in read("/proc/cpuinfo", 200000).splitlines() if l.startswith("flags")), "")
+    put("environment", {
+        "uname": " ".join(platform.uname()),
+        "uid": os.getuid(),
+        "cpus": os.cpu_count(),
+        "mem_total": next((l for l in read("/proc/meminfo").splitlines() if l.startswith("MemTotal")), ""),
+        "cap_eff": status.get("CapEff"), "seccomp": status.get("Seccomp"),
+        "no_new_privs": status.get("NoNewPrivs"),
+        "cgroup_fs": sh(["stat", "-f", "-c", "%T", "/sys/fs/cgroup"])["out"].strip(),
+        "cgroup": cg,
+        "dev_kvm_exists": kvm, "dev_kvm_open": kvm_open,
+        "cpu_virt_flags": [f for f in ("vmx", "svm", "hypervisor", "sev", "sev_snp", "tdx_guest") if f" {f}" in flags],
+        "max_user_namespaces": read("/proc/sys/user/max_user_namespaces").strip(),
+        "unshare_user": sh(["unshare", "-U", "true"]),
+        "unshare_mount_pid": sh(["unshare", "-m", "-p", "-f", "true"]),
+    })
+
+
+def install():
+    urllib.request.urlretrieve(URL, "/tmp/gvisor.tar.bz2")
+    urllib.request.urlretrieve(URL + ".sha512", "/tmp/gvisor.tar.bz2.sha512")
+    want = open("/tmp/gvisor.tar.bz2.sha512").read().split()[0]
+    got = hashlib.sha512(open("/tmp/gvisor.tar.bz2", "rb").read()).hexdigest()
+    if want != got:
+        raise RuntimeError("gvisor tarball checksum mismatch")
+    with tarfile.open("/tmp/gvisor.tar.bz2") as t:
+        t.extractall("/usr/local/bin", members=[m for m in t.getmembers() if m.name == "runsc" or m.name.startswith("gvisor-bin")], filter="data")
+    put("runsc_version", sh([RUNSC, "--version"])["out"].strip())
+
+
+def runsc_do(platform_name, cmd, extra=(), timeout=120):
+    root = tempfile.mkdtemp(prefix="runsc-")
+    return sh([RUNSC, f"--root={root}", f"--platform={platform_name}", "--network=none", *extra,
+               "do", "--", *cmd], timeout=timeout)
+
+
+def platforms():
+    out = {}
+    for p in ("systrap", "ptrace", "kvm"):
+        for label, extra in (("default", ()), ("ignore_cgroups", ("--ignore-cgroups",)), ("rootless", ("--rootless",))):
+            r = runsc_do(p, ["/bin/sh", "-c", "uname -r; id -u; cat /proc/self/status | grep Seccomp"], extra)
+            out[f"{p}/{label}"] = r
+            if r.get("rc") == 0:
+                break
+    put("platforms", out)
+    return next((k for k, v in out.items() if v.get("rc") == 0), None)
+
+
+def flags_for(working):
+    p, label = working.split("/")
+    extra = {"default": (), "ignore_cgroups": ("--ignore-cgroups",), "rootless": ("--rootless",)}[label]
+    return p, extra
+
+
+PY_SYSCALLS = "import os,time;t=time.time();[os.stat('/') for _ in range(200000)];print(round(time.time()-t,3))"
+PY_CPU = "import time;t=time.time();sum(i*i for i in range(5000000));print(round(time.time()-t,3))"
+PY_IO = ("import os,time;t=time.time();b=os.urandom(1<<20);f=open('/tmp/x','wb');[f.write(b) for _ in range(200)];"
+         "f.close();open('/tmp/x','rb').read();os.remove('/tmp/x');print(round(time.time()-t,3))")
+PY_NET = ("import socket\ntry:\n socket.create_connection(('1.1.1.1',443),timeout=5);print('REACHED')\n"
+          "except Exception as e:\n print('blocked',type(e).__name__)")
+
+
+def overhead(p, extra):
+    out = {}
+    for name, code in (("startup", "pass"), ("stat_200k", PY_SYSCALLS), ("cpu", PY_CPU), ("io_200MiB", PY_IO)):
+        native = sh(["python3", "-c", code])
+        sandboxed = runsc_do(p, ["python3", "-c", code], extra)
+        out[name] = {"native_s": native.get("s"), "native_out": native.get("out", "").strip(),
+                     "sandbox_s": sandboxed.get("s"), "sandbox_out": sandboxed.get("out", "").strip(),
+                     "sandbox_rc": sandboxed.get("rc"), "sandbox_err": sandboxed.get("err", "")[-300:]}
+    out["empty_sandbox_start"] = [runsc_do(p, ["true"], extra).get("s") for _ in range(3)]
+    out["network_none"] = runsc_do(p, ["python3", "-c", PY_NET], extra).get("out", "").strip()
+    put("overhead", out)
+
+
+def memory_limit(p, extra):
+    out = {}
+    for mib in (100, 600):
+        bundle = tempfile.mkdtemp(prefix="bundle-")
+        spec = sh([RUNSC, "spec"], cwd=bundle)
+        if spec.get("rc") != 0:
+            put("memory_limit", {"spec": spec})
+            return
+        path = os.path.join(bundle, "config.json")
+        cfg = json.load(open(path))
+        cfg["process"]["terminal"] = False
+        cfg["process"]["args"] = ["python3", "-c", f"b=bytearray({mib}<<20);b[::4096]=b'x'*len(b[::4096]);print('allocated {mib} MiB')"]
+        cfg["root"] = {"path": "/", "readonly": True}
+        cfg.setdefault("linux", {}).setdefault("resources", {})["memory"] = {"limit": 256 << 20, "swap": 256 << 20}
+        cfg["linux"]["cgroupsPath"] = f"/fount-probe-mem{mib}"
+        json.dump(cfg, open(path, "w"))
+        root = tempfile.mkdtemp(prefix="runsc-")
+        out[f"alloc_{mib}MiB_under_256MiB_limit"] = sh(
+            [RUNSC, f"--root={root}", f"--platform={p}", "--network=none", *extra, "run", "--bundle", bundle, f"mem{mib}"])
+    put("memory_limit", out)
+
+
+def concurrent(p, extra, n=8):
+    with ThreadPoolExecutor(n) as pool:
+        rs = list(pool.map(lambda _: runsc_do(p, ["python3", "-c", "import time;time.sleep(5);print('ok')"], extra),
+                           range(n)))
+    put("concurrent_8", {"ok": sum(1 for r in rs if r.get("rc") == 0), "seconds": [r.get("s") for r in rs],
+                         "first_failure": next((r for r in rs if r.get("rc") != 0), None)})
+
+
+def run():
+    for name, step in (("environment", environment), ("install", install)):
+        put("phase", name)
+        try:
+            step()
+        except Exception as e:
+            put(f"{name}_error", f"{type(e).__name__}: {e}")
+            if name == "install":
+                put("phase", "done")
+                return
+    put("phase", "platforms")
+    working = platforms()
+    put("working", working)
+    if working:
+        p, extra = flags_for(working)
+        for name, step in (("overhead", overhead), ("memory_limit", memory_limit), ("concurrent", concurrent)):
+            put("phase", name)
+            try:
+                step(p, extra)
+            except Exception as e:
+                put(f"{name}_error", f"{type(e).__name__}: {e}")
+    put("phase", "done")
+    put("elapsed_s", round(time.time() - BOOTED))
+    print(json.dumps(results), flush=True)
+
+
+def peer():
+    url = os.environ.get("PEER_URL")
+    if not url:
+        return None
+    try:
+        with urllib.request.urlopen(url, timeout=5) as r:
+            return json.load(r)
+    except Exception as e:
+        return {"unreachable": f"{type(e).__name__}: {e}"}
+
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        other = peer()
+        with lock:
+            body = json.dumps({**results, "peer_without_cvm_admin": other} if other is not None else results, indent=1).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+threading.Thread(target=run, daemon=True).start()
+ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PROBE_PORT", "8080"))), H).serve_forever()
